@@ -1,7 +1,24 @@
+function classExists(className) {
+    try {
+        Java.use(className);
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
 // 绕过 OkHttp 的 CertificatePinner
 function bypassCertificatePinner() {
     Java.perform(function () {
-        var CertificatePinner = Java.use("okhttp3.CertificatePinner");
+
+        const className = "okhttp3.CertificatePinner";
+
+        if (!classExists(className)) {
+            console.warn(`[!] ${className} not found, skip OkHttp hook`);
+            return;
+        }
+
+        var CertificatePinner = Java.use(className);
 
         // Hook OkHttp 3 的 check(hostname, peerCertificates)
         try {
@@ -152,34 +169,87 @@ function bypassSslCtxSetVerify() {
 
 
 /**
- * 绕过 BoringSSL 的 SSL_CTX_set_custom_verify 自定义证书验证
- * @param {string} moduleName - 包含 SSL_CTX_set_custom_verify 的模块名（如 libttboringssl.so）
+ * Bypass SSL pinning by hooking SSL_CTX_set_custom_verify
+ *
+ * This function hooks the native SSL verification entry point used by:
+ * - BoringSSL (libttboringssl.so)
+ * - Cronet (libsscronet.so)
+ *
+ * Core idea:
+ *   1. Intercept SSL_CTX_set_custom_verify
+ *   2. Grab the verify callback (args[2])
+ *   3. Hook the callback and force return 0 (verification success)
+ *
+ * @param {string} moduleName
+ *        Target module name (e.g. "libttboringssl.so", "libsscronet.so")
+ *
+ * @param {boolean} printBacktrace
+ *        Whether to print native backtrace when SSL_CTX_set_custom_verify is called
+ *        Useful for analyzing call chain (default: false)
  */
-function bypassBoringSslCustomVerify(moduleName) {
+function bypassSslCustomVerify(moduleName, printBacktrace = false) {
+
+    // Wait until target module is loaded into memory
     waitForModule(moduleName).then((mod) => {
+
         const funcName = "SSL_CTX_set_custom_verify";
+
+        // Locate symbol inside specific module
         const addr = Module.findExportByName(mod.name, funcName);
+
         if (!addr) {
-            console.warn(`[!] 未找到符号 ${funcName}`);
+            console.warn(`[!] ${funcName} not found in ${mod.name}`);
             return;
         }
 
-        const SSL_CTX_set_custom_verify = new NativeFunction(addr, 'void', ['pointer', 'int', 'pointer']);
-        const hook_callback = (callbackPtr) => {
-            const cb = new NativeFunction(callbackPtr, 'int', ['pointer', 'pointer']);
-            Interceptor.attach(cb, {
-                onLeave(retval) {
-                    retval.replace(0); // ssl_verify_ok
+        console.log(`[+] Hooking ${funcName} @ ${addr} in ${mod.name}`);
+
+        // Attach to SSL_CTX_set_custom_verify
+        Interceptor.attach(addr, {
+
+            onEnter(args) {
+
+                const caller = Process.findModuleByAddress(this.returnAddress);
+
+                // args[2] = verify callback function pointer
+                const cbPtr = args[2];
+
+                // 构造统一日志（避免多线程输出错乱）
+                let log = `[Hit] ${mod.name} -> ${funcName} ` +
+                          `| caller=${caller ? caller.name : "unknown"} ` +
+                          `| cb=${cbPtr}`;
+
+                if (printBacktrace) {
+                    const bt = Thread.backtrace(this.context, Backtracer.ACCURATE)
+                        .map(DebugSymbol.fromAddress)
+                        .join("\n");
+
+                    log += `\n---- Backtrace ----\n${bt}\n-------------------`;
                 }
-            });
-        };
 
-        Interceptor.replace(SSL_CTX_set_custom_verify, new NativeCallback((ssl, mode, cb) => {
-            hook_callback(cb);
-            SSL_CTX_set_custom_verify(ssl, mode, cb);
-        }, 'void', ['pointer', 'int', 'pointer']));
+                // 一次性输出
+                console.log(log);
 
-        console.log(`[Bypass] Hooked ${funcName} in ${mod.name}`);
+                try {
+                    //int callback(void* ssl, void* x509_ctx)
+                    const cb = new NativeFunction(cbPtr, 'int', ['pointer', 'pointer']);
+
+                    // Hook verify callback
+                    Interceptor.attach(cb, {
+
+                        onLeave(retval) {
+
+                            console.log(`[Bypass] verify callback from ${moduleName} | cb=${cbPtr}`);
+
+                            retval.replace(0); // SSL_VERIFY_OK
+                        }
+                    });
+
+                } catch (e) {
+                    console.error(`[!] Failed to hook callback @ ${cbPtr}: ${e}`);
+                }
+            }
+        });
     });
 }
 
@@ -188,9 +258,15 @@ setImmediate(function () {
     bypassCertificatePinner()
     bypassTrustManager()
     // bypassSslCtxSetVerify();
-    bypassBoringSslCustomVerify("libttboringssl.so"); // 抖音系
+
+    // BoringSSL
+    bypassSslCustomVerify("libttboringssl.so", true); // 抖音系
+
+    // Cronet
+    bypassSslCustomVerify("libsscronet.so", true);  // Tiktok
 });
 
 
 // frida -H 127.0.0.1:1234 -F -l ssl-pinning-bypass.js
 // frida -H 127.0.0.1:1234 -l ssl-pinning-bypass.js -f com.ss.android.ugc.aweme
+// frida -H 127.0.0.1:1234 -l ssl-pinning-bypass.js -f com.zhiliaoapp.musically

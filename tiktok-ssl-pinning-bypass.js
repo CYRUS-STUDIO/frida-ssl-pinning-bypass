@@ -125,3 +125,4 @@ Java.perform(function() {
 
 // frida -H 127.0.0.1:1234 -F -l tiktok-ssl-pinning-bypass.js
 // frida -H 127.0.0.1:1234 -l tiktok-ssl-pinning-bypass.js -f com.ss.android.ugc.aweme
+// frida -H 127.0.0.1:1234 -l tiktok-ssl-pinning-bypass.js -f com.zhiliaoapp.musically
